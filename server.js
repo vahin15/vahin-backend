@@ -78,8 +78,12 @@ try {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (raw) {
     let parsed;
-    try { parsed = JSON.parse(raw); }
-    catch (e) { parsed = JSON.parse(Buffer.from(raw, 'base64').toString('utf8')); }
+    try { 
+      parsed = JSON.parse(raw); 
+    } catch (e) { 
+      // Decodes Base64 string from PowerShell automatically if raw JSON parsing fails
+      parsed = JSON.parse(Buffer.from(raw, 'base64').toString('utf8')); 
+    }
     admin.initializeApp({ credential: admin.credential.cert(parsed) });
     firebaseReady = true;
     console.log('Firebase Admin initialized — FCM push (native ringing) is ENABLED.');
@@ -160,7 +164,12 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.set('trust proxy', true); // so req.ip reflects the real client on Render
 
-app.get('/health', (req, res) => res.json({ ok: true, time: Date.now(), fcmEnabled: firebaseReady, storage: useFirestore ? 'firestore' : 'file' }));
+app.get('/health', (req, res) => res.json({ 
+  ok: true, 
+  time: Date.now(), 
+  fcmEnabled: firebaseReady, 
+  storage: useFirestore ? 'firestore' : 'file' 
+}));
 
 app.get('/vapid-public-key', (req, res) => {
   res.json({ key: VAPID_PUBLIC_KEY });
