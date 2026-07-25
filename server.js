@@ -10,10 +10,13 @@ const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8787;
 const DB_PATH = path.join(__dirname, 'data', 'subscriptions.json');
+const USERS_PATH = path.join(__dirname, 'data', 'users.json');
 
 // ── VAPID keys (browser Web Push fallback — only useful while the WebView
 //    process is alive; does NOT wake a fully-killed Android app) ──
@@ -158,6 +161,56 @@ async function saveEntry(cleanId, entry) {
   saveFileDB();
 }
 
+// ── User accounts (ID + password) ───────────────────────────────────────
+// Same storage strategy as subscriptions above: Firestore if Firebase is
+// configured (survives redeploys), otherwise a local JSON file (wiped on
+// every free-tier redeploy — an account made between deploys can be lost
+// until you set FIREBASE_SERVICE_ACCOUNT_JSON).
+let fileUsers = loadFileUsers();
+function loadFileUsers() {
+  try {
+    if (!fs.existsSync(USERS_PATH)) return {};
+    return JSON.parse(fs.readFileSync(USERS_PATH, 'utf8') || '{}');
+  } catch (e) { return {}; }
+}
+function saveFileUsers() {
+  fs.mkdirSync(path.dirname(USERS_PATH), { recursive: true });
+  fs.writeFileSync(USERS_PATH, JSON.stringify(fileUsers, null, 2));
+}
+function cleanUserId(id) {
+  return String(id || '').toLowerCase().trim().replace(/[^a-z0-9_-]/g, '');
+}
+async function getUser(cleanId) {
+  if (useFirestore) {
+    const doc = await fsDb.collection('users').doc(cleanId).get();
+    return doc.exists ? doc.data() : null;
+  }
+  return fileUsers[cleanId] || null;
+}
+async function saveUser(cleanId, userData) {
+  if (useFirestore) {
+    await fsDb.collection('users').doc(cleanId).set(userData);
+    return;
+  }
+  fileUsers[cleanId] = userData;
+  saveFileUsers();
+}
+// token -> id, in memory. Resets on restart/redeploy, meaning a logged-in
+// session has to log in again once after a redeploy — the account itself
+// (id + password hash) is unaffected, since that's stored separately above.
+const activeTokens = new Map();
+function issueToken(cleanId) {
+  const token = crypto.randomBytes(24).toString('hex');
+  activeTokens.set(token, cleanId);
+  return token;
+}
+function ownerOfToken(req) {
+  const auth = req.get('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  return token ? activeTokens.get(token) || null : null;
+}
+const authLimiter = rateLimit({ windowMs: 60_000, max: 10 }); // 10 attempts/min/IP — brute-force guard
+
 // ── App ──
 const app = express();
 app.use(cors());
@@ -175,8 +228,49 @@ app.get('/vapid-public-key', (req, res) => {
   res.json({ key: VAPID_PUBLIC_KEY });
 });
 
+// Create a new Vahin ID + password. Fails if the ID is already taken —
+// this is what stops anyone else from claiming an ID that's already in use.
+app.post('/auth/register', authLimiter, async (req, res) => {
+  const cleanId = cleanUserId(req.body && req.body.id);
+  const password = (req.body && req.body.password) || '';
+  if (!cleanId || cleanId.length < 2) return res.status(400).json({ error: 'Invalid ID' });
+  if (password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  const existing = await getUser(cleanId);
+  if (existing) return res.status(409).json({ error: 'That ID is already taken' });
+  const passwordHash = await bcrypt.hash(password, 10);
+  await saveUser(cleanId, { passwordHash, createdAt: Date.now() });
+  res.json({ ok: true, token: issueToken(cleanId) });
+});
+
+// Log back into an existing ID with its password — this is how someone
+// gets their ID back after reinstalling the app or switching phones.
+app.post('/auth/login', authLimiter, async (req, res) => {
+  const cleanId = cleanUserId(req.body && req.body.id);
+  const password = (req.body && req.body.password) || '';
+  if (!cleanId || !password) return res.status(400).json({ error: 'ID and password required' });
+  const user = await getUser(cleanId);
+  if (!user) return res.status(401).json({ error: 'Wrong ID or password' });
+  const ok = await bcrypt.compare(password, user.passwordHash);
+  if (!ok) return res.status(401).json({ error: 'Wrong ID or password' });
+  res.json({ ok: true, token: issueToken(cleanId) });
+});
+
+// Requires a valid bearer token whose owner matches the id the request is
+// acting as — stops someone who never logged in from planting an FCM token
+// or triggering /notify under an ID that isn't theirs.
+function requireOwnId(idField) {
+  return (req, res, next) => {
+    const owner = ownerOfToken(req);
+    const claimedId = cleanUserId((req.body && req.body[idField]) || '');
+    if (!owner || owner !== claimedId) {
+      return res.status(401).json({ error: 'Not authorized for this ID — please log in again' });
+    }
+    next();
+  };
+}
+
 // Register / update a browser Web Push subscription for a given Vahin ID.
-app.post('/subscribe', requireApiKey, registerLimiter, async (req, res) => {
+app.post('/subscribe', requireApiKey, registerLimiter, requireOwnId('id'), async (req, res) => {
   const { id, subscription } = req.body || {};
   if (!id || !subscription || !subscription.endpoint) {
     return res.status(400).json({ error: 'id and subscription required' });
@@ -188,7 +282,7 @@ app.post('/subscribe', requireApiKey, registerLimiter, async (req, res) => {
   res.json({ ok: true, devices: entry.push.length });
 });
 
-app.post('/unsubscribe', requireApiKey, async (req, res) => {
+app.post('/unsubscribe', requireApiKey, requireOwnId('id'), async (req, res) => {
   const { id, endpoint } = req.body || {};
   if (!id || !endpoint) return res.status(400).json({ error: 'id and endpoint required' });
   const { cleanId, entry } = await getEntry(id);
@@ -198,7 +292,7 @@ app.post('/unsubscribe', requireApiKey, async (req, res) => {
 });
 
 // Register / update a native FCM registration token for a given Vahin ID.
-app.post('/register-fcm', requireApiKey, registerLimiter, async (req, res) => {
+app.post('/register-fcm', requireApiKey, registerLimiter, requireOwnId('id'), async (req, res) => {
   const { id, token } = req.body || {};
   if (!id || !token) return res.status(400).json({ error: 'id and token required' });
   const { cleanId, entry } = await getEntry(id);
@@ -207,7 +301,7 @@ app.post('/register-fcm', requireApiKey, registerLimiter, async (req, res) => {
   res.json({ ok: true, devices: entry.fcm.length, fcmEnabled: firebaseReady });
 });
 
-app.post('/unregister-fcm', requireApiKey, async (req, res) => {
+app.post('/unregister-fcm', requireApiKey, requireOwnId('id'), async (req, res) => {
   const { id, token } = req.body || {};
   if (!id || !token) return res.status(400).json({ error: 'id and token required' });
   const { cleanId, entry } = await getEntry(id);
@@ -218,7 +312,7 @@ app.post('/unregister-fcm', requireApiKey, async (req, res) => {
 
 // Trigger a push notification to a target Vahin ID.
 // Body: { to, type: 'call'|'voice-call'|'message'|'group'|'conf', from, text? }
-app.post('/notify', requireApiKey, notifyLimiter, async (req, res) => {
+app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (req, res) => {
   const { to, type, from, text } = req.body || {};
   if (!to || !type || !from) return res.status(400).json({ error: 'to, type, from required' });
   const { cleanId: cleanTo, entry } = await getEntry(to);
