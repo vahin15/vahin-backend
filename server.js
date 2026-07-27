@@ -26,19 +26,9 @@ const VAPID_SUBJECT     = process.env.VAPID_SUBJECT || 'mailto:admin@vahinconnec
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
 // ── Shared-secret auth ──────────────────────────────────────────────────
-// Without this, anyone who knows (or guesses/enumerates) a Vahin ID can hit
-// /notify and make that person's phone ring, or hit /register-fcm and plant
-// a token, with zero proof they're the real app. Every "write" route below
-// now requires a header:  x-vahin-key: <API_SHARED_SECRET>
-//
-// Set API_SHARED_SECRET here (Render → Environment) to any long random
-// string, and set the SAME value in www/index.html's API_SHARED_SECRET
-// constant near the top of the <script>. If this env var is left unset,
-// the check is skipped (so the app doesn't break before you've set both
-// sides) — but you should set it.
 const API_SHARED_SECRET = process.env.API_SHARED_SECRET || '';
 function requireApiKey(req, res, next) {
-  if (!API_SHARED_SECRET) return next(); // not configured yet — don't lock yourself out
+  if (!API_SHARED_SECRET) return next();
   if (req.get('x-vahin-key') !== API_SHARED_SECRET) {
     return res.status(401).json({ error: 'missing or invalid x-vahin-key header' });
   }
@@ -46,12 +36,8 @@ function requireApiKey(req, res, next) {
 }
 
 // ── Minimal in-memory rate limiter (no extra dependency) ────────────────
-// Caps how many times a single IP can hit a route per window. Cheap
-// protection against someone spamming /notify to repeatedly ring a phone,
-// or hammering /register-fcm. Not distributed (per-instance only) — fine
-// for a single free-tier Render dyno.
 function rateLimit({ windowMs, max }) {
-  const hits = new Map(); // ip -> [timestamps]
+  const hits = new Map();
   return function (req, res, next) {
     const ip = req.ip || req.connection.remoteAddress || 'unknown';
     const now = Date.now();
@@ -61,31 +47,23 @@ function rateLimit({ windowMs, max }) {
     }
     arr.push(now);
     hits.set(ip, arr);
-    if (hits.size > 5000) hits.clear(); // crude memory cap for a long-running free dyno
+    if (hits.size > 5000) hits.clear();
     next();
   };
 }
-const notifyLimiter = rateLimit({ windowMs: 60_000, max: 20 });   // 20 calls/min/IP
-const registerLimiter = rateLimit({ windowMs: 60_000, max: 30 }); // 30 registers/min/IP
+const notifyLimiter = rateLimit({ windowMs: 60_000, max: 20 });
+const registerLimiter = rateLimit({ windowMs: 60_000, max: 30 });
 
-// ── Firebase Admin (FCM + Firestore) — THIS is what actually wakes the
-//    Android app when it's fully killed, and (new) also gives us a real
-//    database instead of a JSON file that Render's free tier wipes on
-//    every redeploy.
-//
-//    Set FIREBASE_SERVICE_ACCOUNT_JSON to the full contents of a Firebase
-//    service-account key JSON (Project settings → Service accounts → Generate
-//    new private key, project "unifest-99468"). Raw JSON or base64 both work.
+// ── Firebase Admin (FCM + Firestore) ────────────────────────────────────
 let firebaseReady = false;
 try {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (raw) {
     let parsed;
-    try { 
-      parsed = JSON.parse(raw); 
-    } catch (e) { 
-      // Decodes Base64 string from PowerShell automatically if raw JSON parsing fails
-      parsed = JSON.parse(Buffer.from(raw, 'base64').toString('utf8')); 
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      parsed = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
     }
     admin.initializeApp({ credential: admin.credential.cert(parsed) });
     firebaseReady = true;
@@ -101,11 +79,6 @@ try {
 }
 
 // ── Storage layer ────────────────────────────────────────────────────────
-// Prefers Firestore (persists across Render redeploys/restarts) if Firebase
-// is configured. Falls back to the old flat JSON file otherwise — which
-// still works, but is wiped every time Render redeploys the free-tier
-// instance, so people intermittently have to reopen the app to re-register.
-// Shape per id: { push: [{endpoint, keys:{...}}, ...], fcm: ["token1", ...] }
 let useFirestore = false;
 let fsDb = null;
 if (firebaseReady) {
@@ -120,7 +93,6 @@ if (firebaseReady) {
   console.warn('Firebase not configured — using local JSON file (NOT persistent across redeploys). See .env.example.');
 }
 
-// Local flat-file fallback (unchanged behavior from before).
 let fileDb = loadFileDB();
 function loadFileDB() {
   try {
@@ -162,10 +134,6 @@ async function saveEntry(cleanId, entry) {
 }
 
 // ── User accounts (ID + password) ───────────────────────────────────────
-// Same storage strategy as subscriptions above: Firestore if Firebase is
-// configured (survives redeploys), otherwise a local JSON file (wiped on
-// every free-tier redeploy — an account made between deploys can be lost
-// until you set FIREBASE_SERVICE_ACCOUNT_JSON).
 let fileUsers = loadFileUsers();
 function loadFileUsers() {
   try {
@@ -195,41 +163,74 @@ async function saveUser(cleanId, userData) {
   fileUsers[cleanId] = userData;
   saveFileUsers();
 }
-// token -> id, in memory. Resets on restart/redeploy, meaning a logged-in
-// session has to log in again once after a redeploy — the account itself
-// (id + password hash) is unaffected, since that's stored separately above.
-const activeTokens = new Map();
+
+// ── Stateless signed login tokens ───────────────────────────────────────
+// Previously, tokens were just random strings kept in an in-memory Map
+// (id -> token). That Map lives inside the running Node process, so it is
+// wiped every time Render restarts or redeploys the service (which happens
+// often on the free tier — idle sleep/wake, new deploys, etc). Every
+// logged-in user would then get "Not authorized for this ID — please log
+// in again" out of nowhere, with no warning, even though their account
+// itself was fine.
+//
+// Fix: tokens are now self-verifying. A token is
+//   base64url(id + "." + expiryTimestamp) + "." + HMAC-SHA256(that, secret)
+// Verifying a token just recomputes the HMAC and checks it matches, plus
+// checks the expiry — no server memory involved at all, so it survives
+// restarts/redeploys forever. Set TOKEN_SIGNING_SECRET in Render's
+// Environment tab to any long random string (falls back to a default so
+// this doesn't break before you've set it, same pattern as the other keys
+// in this file — but you should set your own for real security).
+const TOKEN_SIGNING_SECRET = process.env.TOKEN_SIGNING_SECRET || 'unifest-dev-default-secret-change-me';
+const TOKEN_LIFETIME_MS = 1000 * 60 * 60 * 24 * 90; // 90 days
+
 function issueToken(cleanId) {
-  const token = crypto.randomBytes(24).toString('hex');
-  activeTokens.set(token, cleanId);
-  return token;
+  const expiresAt = Date.now() + TOKEN_LIFETIME_MS;
+  const payload = `${cleanId}.${expiresAt}`;
+  const sig = crypto.createHmac('sha256', TOKEN_SIGNING_SECRET).update(payload).digest('hex');
+  return Buffer.from(`${payload}.${sig}`).toString('base64url');
 }
 function ownerOfToken(req) {
   const auth = req.get('authorization') || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  return token ? activeTokens.get(token) || null : null;
+  const raw = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!raw) return null;
+  let decoded;
+  try {
+    decoded = Buffer.from(raw, 'base64url').toString('utf8');
+  } catch (e) { return null; }
+  const parts = decoded.split('.');
+  if (parts.length !== 3) return null;
+  const [cleanId, expiresAtStr, sig] = parts;
+  const expiresAt = Number(expiresAtStr);
+  if (!cleanId || !expiresAt || !sig) return null;
+  if (Date.now() > expiresAt) return null; // expired
+  const expectedSig = crypto.createHmac('sha256', TOKEN_SIGNING_SECRET)
+    .update(`${cleanId}.${expiresAtStr}`).digest('hex');
+  // Constant-time compare
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expectedSig);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  return cleanId;
 }
-const authLimiter = rateLimit({ windowMs: 60_000, max: 10 }); // 10 attempts/min/IP — brute-force guard
+const authLimiter = rateLimit({ windowMs: 60_000, max: 10 });
 
 // ── App ──
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
-app.set('trust proxy', true); // so req.ip reflects the real client on Render
+app.set('trust proxy', true);
 
-app.get('/health', (req, res) => res.json({ 
-  ok: true, 
-  time: Date.now(), 
-  fcmEnabled: firebaseReady, 
-  storage: useFirestore ? 'firestore' : 'file' 
+app.get('/health', (req, res) => res.json({
+  ok: true,
+  time: Date.now(),
+  fcmEnabled: firebaseReady,
+  storage: useFirestore ? 'firestore' : 'file'
 }));
 
 app.get('/vapid-public-key', (req, res) => {
   res.json({ key: VAPID_PUBLIC_KEY });
 });
 
-// Create a new Vahin ID + password. Fails if the ID is already taken —
-// this is what stops anyone else from claiming an ID that's already in use.
 app.post('/auth/register', authLimiter, async (req, res) => {
   const cleanId = cleanUserId(req.body && req.body.id);
   const password = (req.body && req.body.password) || '';
@@ -242,8 +243,6 @@ app.post('/auth/register', authLimiter, async (req, res) => {
   res.json({ ok: true, token: issueToken(cleanId) });
 });
 
-// Log back into an existing ID with its password — this is how someone
-// gets their ID back after reinstalling the app or switching phones.
 app.post('/auth/login', authLimiter, async (req, res) => {
   const cleanId = cleanUserId(req.body && req.body.id);
   const password = (req.body && req.body.password) || '';
@@ -255,9 +254,6 @@ app.post('/auth/login', authLimiter, async (req, res) => {
   res.json({ ok: true, token: issueToken(cleanId) });
 });
 
-// Requires a valid bearer token whose owner matches the id the request is
-// acting as — stops someone who never logged in from planting an FCM token
-// or triggering /notify under an ID that isn't theirs.
 function requireOwnId(idField) {
   return (req, res, next) => {
     const owner = ownerOfToken(req);
@@ -269,7 +265,6 @@ function requireOwnId(idField) {
   };
 }
 
-// Register / update a browser Web Push subscription for a given Vahin ID.
 app.post('/subscribe', requireApiKey, registerLimiter, requireOwnId('id'), async (req, res) => {
   const { id, subscription } = req.body || {};
   if (!id || !subscription || !subscription.endpoint) {
@@ -291,7 +286,6 @@ app.post('/unsubscribe', requireApiKey, requireOwnId('id'), async (req, res) => 
   res.json({ ok: true });
 });
 
-// Register / update a native FCM registration token for a given Vahin ID.
 app.post('/register-fcm', requireApiKey, registerLimiter, requireOwnId('id'), async (req, res) => {
   const { id, token } = req.body || {};
   if (!id || !token) return res.status(400).json({ error: 'id and token required' });
@@ -310,8 +304,6 @@ app.post('/unregister-fcm', requireApiKey, requireOwnId('id'), async (req, res) 
   res.json({ ok: true });
 });
 
-// Trigger a push notification to a target Vahin ID.
-// Body: { to, type: 'call'|'voice-call'|'message'|'group'|'conf', from, text? }
 app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (req, res) => {
   const { to, type, from, text } = req.body || {};
   if (!to || !type || !from) return res.status(400).json({ error: 'to, type, from required' });
@@ -326,8 +318,6 @@ app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (r
   if (firebaseReady && entry.fcm.length) {
     for (const token of entry.fcm) {
       try {
-        // Data-only message: no "notification" field, so it reaches
-        // VahinMessagingService.onMessageReceived() even when the app is killed.
         await admin.messaging().send({
           token,
           data: { type: String(type), from: String(from), text: String(text || '') },
@@ -423,4 +413,5 @@ server.listen(PORT, () => {
   console.log(`FCM (native ringing): ${firebaseReady ? 'ENABLED' : 'DISABLED — set FIREBASE_SERVICE_ACCOUNT_JSON'}`);
   console.log(`Storage: ${useFirestore ? 'Firestore (persistent)' : 'local JSON file (NOT persistent across redeploys)'}`);
   console.log(`API key auth: ${API_SHARED_SECRET ? 'ENABLED' : 'DISABLED — set API_SHARED_SECRET'}`);
+  console.log(`Login tokens: stateless, signed, survive redeploys (90-day expiry)`);
 });
