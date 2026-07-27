@@ -236,22 +236,51 @@ app.post('/auth/register', authLimiter, async (req, res) => {
   const password = (req.body && req.body.password) || '';
   if (!cleanId || cleanId.length < 2) return res.status(400).json({ error: 'Invalid ID' });
   if (password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
-  const existing = await getUser(cleanId);
-  if (existing) return res.status(409).json({ error: 'That ID is already taken' });
-  const passwordHash = await bcrypt.hash(password, 10);
-  await saveUser(cleanId, { passwordHash, createdAt: Date.now() });
-  res.json({ ok: true, token: issueToken(cleanId) });
+  try {
+    const existing = await getUser(cleanId);
+    console.log(`[register] checked "${cleanId}" — existing=${JSON.stringify(existing)}`);
+    if (existing) return res.status(409).json({ error: 'That ID is already taken' });
+    const passwordHash = await bcrypt.hash(password, 10);
+    await saveUser(cleanId, { passwordHash, createdAt: Date.now() });
+    console.log(`[register] created "${cleanId}" successfully`);
+    return res.json({ ok: true, token: issueToken(cleanId) });
+  } catch (err) {
+    console.error(`[register] REAL ERROR for "${cleanId}":`, err);
+    return res.status(500).json({ error: 'Server error while checking/creating ID: ' + err.message });
+  }
 });
 
 app.post('/auth/login', authLimiter, async (req, res) => {
   const cleanId = cleanUserId(req.body && req.body.id);
   const password = (req.body && req.body.password) || '';
   if (!cleanId || !password) return res.status(400).json({ error: 'ID and password required' });
-  const user = await getUser(cleanId);
-  if (!user) return res.status(401).json({ error: 'Wrong ID or password' });
-  const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) return res.status(401).json({ error: 'Wrong ID or password' });
-  res.json({ ok: true, token: issueToken(cleanId) });
+  try {
+    const user = await getUser(cleanId);
+    if (!user) return res.status(401).json({ error: 'Wrong ID or password' });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: 'Wrong ID or password' });
+    res.json({ ok: true, token: issueToken(cleanId) });
+  } catch (err) {
+    console.error(`[login] REAL ERROR for "${cleanId}":`, err);
+    res.status(500).json({ error: 'Server error while logging in: ' + err.message });
+  }
+});
+
+// Temporary diagnostic route — lists every ID currently in the users
+// collection, so we can see exactly what the database actually contains
+// instead of guessing. Remove this once the "ID always taken" bug is fixed.
+app.get('/__debug/list-users', async (req, res) => {
+  try {
+    if (useFirestore) {
+      const snap = await fsDb.collection('users').get();
+      const ids = snap.docs.map(d => d.id);
+      return res.json({ storage: 'firestore', count: ids.length, ids });
+    }
+    return res.json({ storage: 'file', count: Object.keys(fileUsers).length, ids: Object.keys(fileUsers) });
+  } catch (err) {
+    console.error('[debug list-users] ERROR:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 function requireOwnId(idField) {
