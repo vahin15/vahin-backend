@@ -385,11 +385,46 @@ app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (r
   entry.push = stillValidPush;
   await saveEntry(cleanTo, entry);
 
+  // ── WebSocket ring delivery (SignalService.java's backup path) ──────────
+  // BUG (found 2026-08-04): this route never touched `liveSockets`, so the
+  // always-on WebSocket connection SignalService.java holds open was 100%
+  // decorative for ringing — it only ever received {type:'presence'} and
+  // {type:'roster'}, never {type:'ring'}. SignalService.java's whole
+  // `if ("ring".equals(type))` branch was dead code. Every "backup path"
+  // ring depended entirely on FCM, with zero actual redundancy, which is
+  // why calls stopped ringing once FCM alone couldn't wake a killed
+  // process (e.g. OnePlus/OxygenOS auto-launch kills). Fixed by actually
+  // forwarding the ring over any open socket for `to`, mirroring the FCM
+  // payload.
+  let wsDelivered = 0;
+  const sockets = liveSockets.get(cleanTo);
+  if (sockets && sockets.size) {
+    const ringMsg = JSON.stringify({ type: 'ring', callType: type, from, text: text || '' });
+    for (const ws of sockets) {
+      if (ws.readyState === ws.OPEN) {
+        try {
+          ws.send(ringMsg);
+          wsDelivered++;
+        } catch (err) {
+          console.error(`[notify] WS ring send FAILED for "${cleanTo}":`, err.message);
+        }
+      }
+    }
+  }
+  if (wsDelivered === 0 && fcmDelivered === 0 && pushDelivered === 0) {
+    console.error(
+      `[notify] RING NOT DELIVERED to "${cleanTo}" via ANY channel ` +
+      `(ws=0, fcm=0, push=0) — from="${from}" type="${type}". ` +
+      `The callee will not ring.`
+    );
+  }
+
   res.json({
     ok: true,
-    delivered: fcmDelivered + pushDelivered,
+    delivered: fcmDelivered + pushDelivered + wsDelivered,
     fcmDelivered,
     pushDelivered,
+    wsDelivered,
     total: entry.fcm.length + entry.push.length,
     fcmEnabled: firebaseReady,
   });
