@@ -133,6 +133,68 @@ async function saveEntry(cleanId, entry) {
   saveFileDB();
 }
 
+// ── Mailbox (store-and-forward for offline messages) ────────────────────
+// The frontend already calls POST /mailbox/fetch on every app launch
+// (fetchQueuedMailbox() in index.html) expecting queued messages back —
+// that endpoint never existed here, so it always 404'd, was swallowed by
+// an empty catch(), and every message sent to an offline/killed recipient
+// was gone the moment the FCM wake-up ping failed to land. This section
+// makes that endpoint real: /notify durably stores every chat message
+// here regardless of whether the live wake-up attempt succeeded, and the
+// client fetches + acks against it — same store-and-forward shape as
+// WhatsApp/Signal use.
+const MAILBOX_PATH = path.join(__dirname, 'data', 'mailbox.json');
+const MAILBOX_MAX_PER_USER = 200; // hard cap so one abandoned account can't grow unbounded
+
+let fileMailbox = loadFileMailbox();
+function loadFileMailbox() {
+  try {
+    if (!fs.existsSync(MAILBOX_PATH)) return {};
+    return JSON.parse(fs.readFileSync(MAILBOX_PATH, 'utf8') || '{}');
+  } catch (e) { return {}; }
+}
+function saveFileMailbox() {
+  fs.mkdirSync(path.dirname(MAILBOX_PATH), { recursive: true });
+  fs.writeFileSync(MAILBOX_PATH, JSON.stringify(fileMailbox, null, 2));
+}
+
+async function queueMailboxMessage(toCleanId, msg) {
+  if (useFirestore) {
+    const ref = fsDb.collection('mailbox').doc(toCleanId);
+    const doc = await ref.get();
+    const list = doc.exists ? (doc.data().messages || []) : [];
+    list.push(msg);
+    while (list.length > MAILBOX_MAX_PER_USER) list.shift();
+    await ref.set({ messages: list });
+    return;
+  }
+  if (!fileMailbox[toCleanId]) fileMailbox[toCleanId] = [];
+  fileMailbox[toCleanId].push(msg);
+  while (fileMailbox[toCleanId].length > MAILBOX_MAX_PER_USER) fileMailbox[toCleanId].shift();
+  saveFileMailbox();
+}
+async function getMailboxMessages(cleanId) {
+  if (useFirestore) {
+    const doc = await fsDb.collection('mailbox').doc(cleanId).get();
+    return doc.exists ? (doc.data().messages || []) : [];
+  }
+  return fileMailbox[cleanId] || [];
+}
+async function ackMailboxMessages(cleanId, ackIds) {
+  const idSet = new Set(ackIds.map(String));
+  if (useFirestore) {
+    const ref = fsDb.collection('mailbox').doc(cleanId);
+    const doc = await ref.get();
+    const list = doc.exists ? (doc.data().messages || []) : [];
+    const remaining = list.filter(m => !idSet.has(String(m.id)));
+    await ref.set({ messages: remaining });
+    return;
+  }
+  if (!fileMailbox[cleanId]) return;
+  fileMailbox[cleanId] = fileMailbox[cleanId].filter(m => !idSet.has(String(m.id)));
+  saveFileMailbox();
+}
+
 // ── User accounts (ID + password) ───────────────────────────────────────
 let fileUsers = loadFileUsers();
 function loadFileUsers() {
@@ -338,8 +400,26 @@ app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (r
   if (!to || !type || !from) return res.status(400).json({ error: 'to, type, from required' });
   const { cleanId: cleanTo, entry } = await getEntry(to);
 
+  // Queued unconditionally, before any early return below — a message must
+  // survive even when the recipient has zero push/FCM subscriptions
+  // registered (fresh install, reinstall, notification permission never
+  // granted, etc). Previously the "no subscriptions" branch returned before
+  // any queuing logic ran at all, so those messages vanished with no trace.
+  if (type === 'message' && text) {
+    try {
+      await queueMailboxMessage(cleanTo, {
+        id: crypto.randomUUID(),
+        from: String(from),
+        text: String(text),
+        ts: Date.now(),
+      });
+    } catch (err) {
+      console.error(`[notify] failed to queue mailbox message for "${cleanTo}":`, err.message);
+    }
+  }
+
   if (!entry.push.length && !entry.fcm.length) {
-    return res.json({ ok: true, delivered: 0, reason: 'no subscriptions for this id' });
+    return res.json({ ok: true, delivered: 0, wsDelivered: 0, queued: type === 'message', reason: 'no subscriptions for this id' });
   }
 
   let fcmDelivered = 0;
@@ -428,6 +508,91 @@ app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (r
     total: entry.fcm.length + entry.push.length,
     fcmEnabled: firebaseReady,
   });
+});
+
+app.post('/mailbox/fetch', requireApiKey, requireOwnId('id'), async (req, res) => {
+  const cleanId = cleanUserId((req.body && req.body.id) || '');
+  if (!cleanId) return res.status(400).json({ error: 'id required' });
+  try {
+    const messages = await getMailboxMessages(cleanId);
+    res.json({ ok: true, messages });
+  } catch (err) {
+    console.error(`[mailbox/fetch] ERROR for "${cleanId}":`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/mailbox/ack', requireApiKey, requireOwnId('id'), async (req, res) => {
+  const cleanId = cleanUserId((req.body && req.body.id) || '');
+  const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids : [];
+  if (!cleanId || !ids.length) return res.status(400).json({ error: 'id and ids[] required' });
+  try {
+    await ackMailboxMessages(cleanId, ids);
+    res.json({ ok: true, acked: ids.length });
+  } catch (err) {
+    console.error(`[mailbox/ack] ERROR for "${cleanId}":`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DP (profile picture) ─────────────────────────────────────────────────
+// Stored as a data URL on the user record itself (reuses the existing
+// users store — no new storage layer needed). Capped well under Firestore's
+// 1MB document limit; the client is expected to downscale before upload
+// (index.html does this via canvas before calling this route), but the
+// cap is enforced here too since the client can't be trusted.
+const DP_MAX_CHARS = 300_000; // ~220KB of actual image data once base64 overhead is backed out
+
+app.post('/profile/dp', requireApiKey, requireOwnId('id'), async (req, res) => {
+  const cleanId = cleanUserId((req.body && req.body.id) || '');
+  const dataUrl = (req.body && req.body.dataUrl) || '';
+  if (!cleanId || !dataUrl) return res.status(400).json({ error: 'id and dataUrl required' });
+  if (!/^data:image\/(png|jpe?g|webp);base64,/.test(dataUrl)) {
+    return res.status(400).json({ error: 'dataUrl must be a base64 png/jpeg/webp data URL' });
+  }
+  if (dataUrl.length > DP_MAX_CHARS) {
+    return res.status(413).json({ error: `Image too large — keep it under ~${Math.round(DP_MAX_CHARS / 1.37 / 1024)}KB` });
+  }
+  try {
+    const user = await getUser(cleanId);
+    if (!user) return res.status(404).json({ error: 'user not found' });
+    user.dp = dataUrl;
+    await saveUser(cleanId, user);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`[profile/dp POST] ERROR for "${cleanId}":`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/profile/dp', requireApiKey, requireOwnId('id'), async (req, res) => {
+  const cleanId = cleanUserId((req.body && req.body.id) || '');
+  if (!cleanId) return res.status(400).json({ error: 'id required' });
+  try {
+    const user = await getUser(cleanId);
+    if (!user) return res.status(404).json({ error: 'user not found' });
+    delete user.dp;
+    await saveUser(cleanId, user);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`[profile/dp DELETE] ERROR for "${cleanId}":`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Public read (no owner check — any logged-in client needs to be able to
+// show any contact's DP, not just their own), but still requires the shared
+// API key so it's not a fully open scrape endpoint.
+app.get('/profile/dp/:id', requireApiKey, async (req, res) => {
+  const cleanId = cleanUserId(req.params.id || '');
+  if (!cleanId) return res.status(400).json({ error: 'id required' });
+  try {
+    const user = await getUser(cleanId);
+    res.json({ ok: true, dp: (user && user.dp) || null });
+  } catch (err) {
+    console.error(`[profile/dp GET] ERROR for "${cleanId}":`, err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Presence (lightweight WebSocket hub) ──
