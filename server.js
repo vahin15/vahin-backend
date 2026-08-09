@@ -13,6 +13,7 @@ const http = require('http');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { WebSocketServer } = require('ws');
+const { ExpressPeerServer } = require('peer');
 
 const PORT = process.env.PORT || 8787;
 const DB_PATH = path.join(__dirname, 'data', 'subscriptions.json');
@@ -26,6 +27,14 @@ const VAPID_SUBJECT     = process.env.VAPID_SUBJECT || 'mailto:admin@vahinconnec
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
 // ── Shared-secret auth ──────────────────────────────────────────────────
+// Self-hosted PeerJS broker (call signaling / WebRTC handshake). Previously
+// the app pointed at PeerJS's public cloud broker (0.peerjs.com) — that
+// service isn't ours, so a stale ID left behind by a killed-not-closed app
+// could only be evicted on ITS eviction policy/timeline, not ours. Hosting
+// our own PeerServer here (see /peerjs below and patches/peer+*.patch) is
+// what makes the "evict a dead socket immediately, don't make the new
+// client wait/retry" fix possible at all.
+const PEERJS_KEY = process.env.PEERJS_KEY || 'vahin-peerjs';
 const API_SHARED_SECRET = process.env.API_SHARED_SECRET || '';
 function requireApiKey(req, res, next) {
   if (!API_SHARED_SECRET) return next();
@@ -597,8 +606,73 @@ app.get('/profile/dp/:id', requireApiKey, async (req, res) => {
 
 // ── Presence (lightweight WebSocket hub) ──
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/presence' });
+// NOTE: `noServer: true` here (not `server`) is deliberate — see the shared
+// upgrade router below. Two `ws` WebSocketServers both bound directly via
+// `server` on the same http.Server will fight over every upgrade request
+// (whichever registers first 400s anything that isn't its own path, before
+// the other ever gets a look), which silently broke the peer server the
+// first time this was wired up. Passing `noServer: true` to both and
+// routing upgrades ourselves by pathname avoids that entirely.
+const wss = new WebSocketServer({ noServer: true });
+const PRESENCE_WS_PATH = '/presence';
 const liveSockets = new Map();
+
+// ── PeerJS broker (WebRTC call signaling) ────────────────────────────────
+// Mounted on the same HTTP server/port as everything else — Render (and
+// most PaaS hosts) only route one port per service, so this rides along
+// with Express/the /presence WS instead of needing its own listener.
+// The eviction-on-stale-id behavior lives in patches/peer+1.0.2.patch
+// (applied to node_modules/peer via `postinstall: patch-package`) — see
+// that patch for the actual fix; this is just wiring it up.
+//
+// `createWebSocketServer` is peer's own escape hatch for this exact
+// problem: it lets us hand back a `noServer: true` WebSocketServer instead
+// of letting peer create one bound straight to `server` (which is what
+// caused the 400s above). We still need to know the *path* peer expects,
+// so we capture it off the options peer passes in and route to it below.
+let peerWsPath = null;
+let peerWss = null;
+const peerServer = ExpressPeerServer(server, {
+  path: '/',
+  key: PEERJS_KEY,
+  allow_discovery: false,
+  createWebSocketServer: (options) => {
+    peerWsPath = options.path; // e.g. '/peerjs/peerjs'
+    peerWss = new WebSocketServer({ noServer: true });
+    return peerWss;
+  },
+});
+app.use('/peerjs', peerServer);
+
+peerServer.on('connection', (client) => {
+  console.log(`[peerjs] connected: ${client.getId()}`);
+});
+peerServer.on('disconnect', (client) => {
+  console.log(`[peerjs] disconnected: ${client.getId()}`);
+});
+peerServer.on('error', (err) => {
+  console.error('[peerjs] server error:', err && err.message);
+});
+
+// Single shared upgrade router — dispatches by pathname to whichever
+// WebSocketServer actually owns that path, instead of each server fighting
+// over every request (see note above).
+server.on('upgrade', (req, socket, head) => {
+  const pathname = (() => {
+    try { return new URL(req.url, 'http://localhost').pathname; }
+    catch (e) { return req.url; }
+  })();
+
+  if (pathname === PRESENCE_WS_PATH) {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    return;
+  }
+  if (peerWss && pathname === peerWsPath) {
+    peerWss.handleUpgrade(req, socket, head, (ws) => peerWss.emit('connection', ws, req));
+    return;
+  }
+  socket.destroy();
+});
 
 function broadcastPresence(id, online) {
   const msg = JSON.stringify({ type: 'presence', id, online });
