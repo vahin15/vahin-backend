@@ -427,7 +427,17 @@ app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (r
     }
   }
 
-  if (!entry.push.length && !entry.fcm.length) {
+  // FIX (ring delivery): grab this BEFORE the "no subscriptions" early return below —
+  // a live SignalService WebSocket is a delivery channel in its own right, same as a
+  // push subscription or FCM token. The old check only looked at entry.push/entry.fcm
+  // and returned early with zero delivery attempts even when the recipient had an
+  // active WS connection open, which defeated the entire point of the WS ring path
+  // (it exists specifically to cover devices where FCM/push registration hasn't
+  // succeeded yet or has gone stale).
+  const sockets = liveSockets.get(cleanTo);
+  const hasLiveSocket = !!(sockets && sockets.size);
+
+  if (!entry.push.length && !entry.fcm.length && !hasLiveSocket) {
     return res.json({ ok: true, delivered: 0, wsDelivered: 0, queued: type === 'message', reason: 'no subscriptions for this id' });
   }
 
@@ -486,8 +496,7 @@ app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (r
   // forwarding the ring over any open socket for `to`, mirroring the FCM
   // payload.
   let wsDelivered = 0;
-  const sockets = liveSockets.get(cleanTo);
-  if (sockets && sockets.size) {
+  if (hasLiveSocket) {
     const ringMsg = JSON.stringify({ type: 'ring', callType: type, from, text: text || '' });
     for (const ws of sockets) {
       if (ws.readyState === ws.OPEN) {
