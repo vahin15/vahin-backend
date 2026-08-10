@@ -1,0 +1,99 @@
+diff --git a/node_modules/peer/dist/index.cjs b/node_modules/peer/dist/index.cjs
+index 95618a2..5d4bf41 100644
+--- a/node_modules/peer/dist/index.cjs
++++ b/node_modules/peer/dist/index.cjs
+@@ -294,18 +294,21 @@ class $e9ffe6de55430dbc$export$f47674b57e51ee3b extends (0, $cl6Iw$nodeevents.Ev
+         }
+         const client = this.realm.getClientById(id);
+         if (client) {
+-            if (token !== client.getToken()) {
+-                // ID-taken, invalid token
+-                socket.send(JSON.stringify({
+-                    type: (0, $115ef0ff92fe1a17$export$80edbf15fa61a4db).ID_TAKEN,
+-                    payload: {
+-                        msg: "ID is taken"
+-                    }
+-                }));
+-                socket.close();
++            if (token === client.getToken()) {
++                this._configureWS(socket, client);
+                 return;
+             }
+-            this._configureWS(socket, client);
++            // Different token for an ID that's already registered. This is the
++            // normal path an Android client takes on every reconnect (PeerJS
++            // mints a fresh random token per session), so it does NOT by itself
++            // mean the ID is genuinely in use — it just as often means the old
++            // socket belongs to a process that was killed rather than closed
++            // cleanly, and is sitting there looking OPEN at the TCP level while
++            // actually being dead. Blindly sending ID-TAKEN here (the stock
++            // behavior) forces that client through its own retry/backoff loop
++            // for no reason. Probe the old socket first and evict it if it
++            // doesn't answer, instead of making the new connection wait/retry.
++            this._resolveIdConflict(socket, id, token, client);
+             return;
+         }
+         this._registerClient({
+@@ -314,6 +317,62 @@ class $e9ffe6de55430dbc$export$f47674b57e51ee3b extends (0, $cl6Iw$nodeevents.Ev
+             token: token
+         });
+     }
++    // PATCH (vahin-backend): decide ID-TAKEN vs. stale-session eviction by
++    // actually checking whether the existing socket is alive, rather than
++    // assuming a token mismatch means the ID is in genuine use.
++    _resolveIdConflict(newSocket, id, newToken, existingClient) {
++        const STALE_PROBE_TIMEOUT_MS = 1500;
++        const existingSocket = existingClient.getSocket();
++        // Already closed/closing at the transport level — no need to probe.
++        if (!existingSocket || existingSocket.readyState !== existingSocket.OPEN) {
++            this._evictAndRegister(id, newToken, newSocket, existingClient);
++            return;
++        }
++        let settled = false;
++        const onPong = ()=>{
++            if (settled) return;
++            settled = true;
++            clearTimeout(timer);
++            existingSocket.removeListener("pong", onPong);
++            // Old socket answered — it's a genuinely live second session.
++            newSocket.send(JSON.stringify({
++                type: (0, $115ef0ff92fe1a17$export$80edbf15fa61a4db).ID_TAKEN,
++                payload: {
++                    msg: "ID is taken"
++                }
++            }));
++            newSocket.close();
++        };
++        const timer = setTimeout(()=>{
++            if (settled) return;
++            settled = true;
++            existingSocket.removeListener("pong", onPong);
++            // No pong within the window — treat as dead and take over the ID.
++            this._evictAndRegister(id, newToken, newSocket, existingClient);
++        }, STALE_PROBE_TIMEOUT_MS);
++        try {
++            existingSocket.once("pong", onPong);
++            existingSocket.ping();
++        } catch (e) {
++            // ping() itself threw — socket is unusable, evict immediately.
++            clearTimeout(timer);
++            existingSocket.removeListener("pong", onPong);
++            this._evictAndRegister(id, newToken, newSocket, existingClient);
++        }
++    }
++    _evictAndRegister(id, token, newSocket, staleClient) {
++        try {
++            staleClient.getSocket()?.close();
++        } catch (e) {
++        // ignore — we're discarding this socket either way
++        }
++        this.realm.removeClientById(id);
++        this._registerClient({
++            socket: newSocket,
++            id: id,
++            token: token
++        });
++    }
+     _onSocketError(error) {
+         // handle error
+         this.emit("error", error);
