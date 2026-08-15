@@ -455,9 +455,16 @@ app.post('/notify', requireApiKey, notifyLimiter, requireOwnId('from'), async (r
         stillValidFcm.push(token);
       } catch (err) {
         const code = err && err.errorInfo && err.errorInfo.code;
-        if (code !== 'messaging/registration-token-not-registered' &&
-            code !== 'messaging/invalid-registration-token') {
+        const isDeadToken = code === 'messaging/registration-token-not-registered' ||
+                            code === 'messaging/invalid-registration-token';
+        if (!isDeadToken) {
+          // Not a dead token — network error, quota hit, credential issue, etc.
+          // Keep the token (it may still be valid) but surface it in Render logs.
+          console.error(`[notify] FCM send error (non-fatal, keeping token) for "${cleanTo}": ${code || err.message}`);
           stillValidFcm.push(token);
+        } else {
+          // Dead/unregistered token — prune it so it doesn't clog future sends.
+          console.warn(`[notify] pruning dead FCM token for "${cleanTo}": ${code}`);
         }
       }
     }
