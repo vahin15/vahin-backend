@@ -295,7 +295,13 @@ app.get('/health', (req, res) => res.json({
   ok: true,
   time: Date.now(),
   fcmEnabled: firebaseReady,
-  storage: useFirestore ? 'firestore' : 'file'
+  storage: useFirestore ? 'firestore' : 'file',
+  // peerPatchApplied is the direct answer to "is the stale-ID eviction fix
+  // actually live on this deploy" — see the boot-time check above for how
+  // it's derived. If this is false in production, the patch isn't the
+  // problem; the build/deploy step is.
+  peerPatchApplied,
+  peerAliveTimeoutMs: 15000,
 }));
 
 app.get('/vapid-public-key', (req, res) => {
@@ -652,6 +658,14 @@ const peerServer = ExpressPeerServer(server, {
   path: '/',
   key: PEERJS_KEY,
   allow_discovery: false,
+  // Belt-and-suspenders backstop: the real fix is the stale-session eviction
+  // in patches/peer+1.0.2.patch (checked on every reconnect attempt, so it
+  // normally resolves a dead session in ~1.5s). This alive_timeout is peer's
+  // OWN passive sweep, unrelated to that patch — it's what silently used the
+  // library default of 90s before, so if the patch ever fails to load for
+  // any reason (e.g. a deploy step skips postinstall), a dead session would
+  // still block reconnects for up to 90s instead of the ~15s here.
+  alive_timeout: 15000,
   createWebSocketServer: (options) => {
     peerWsPath = options.path; // e.g. '/peerjs/peerjs'
     peerWss = new WebSocketServer({ noServer: true });
@@ -659,6 +673,33 @@ const peerServer = ExpressPeerServer(server, {
   },
 });
 app.use('/peerjs', peerServer);
+
+// ── Verify the eviction patch is actually live in THIS running process ──
+// Answers the "is the patch actually deployed?" question directly from
+// production, without needing shell/dashboard access to the host: read the
+// loaded peer module's own source out of require.cache and check for the
+// patch's marker method. Logged once at boot and exposed on /health so it's
+// checkable from curl alone.
+const peerPatchApplied = (() => {
+  try {
+    // peer's package.json "exports" is strict and blocks resolving arbitrary
+    // subpaths (e.g. 'peer/dist/index.cjs' throws ERR_PACKAGE_PATH_NOT_EXPORTED
+    // even though that's the real file) — require.resolve('peer') itself is
+    // the one subpath exports always allows, and it happens to point at
+    // this exact file, so use that instead of guessing the path.
+    const peerIndexPath = require.resolve('peer');
+    const src = fs.readFileSync(peerIndexPath, 'utf8');
+    return src.includes('_resolveIdConflict') && src.includes('_evictAndRegister');
+  } catch (e) {
+    console.warn('[peerjs] could not verify patch status:', e.message);
+    return false;
+  }
+})();
+console.log(
+  peerPatchApplied
+    ? '[peerjs] stale-session eviction patch: ACTIVE (patches/peer+1.0.2.patch applied)'
+    : '[peerjs] stale-session eviction patch: NOT ACTIVE — falling back to stock ID_TAKEN behavior + 15s alive_timeout sweep. Check that postinstall (patch-package) ran during this deploy\'s build.'
+);
 
 peerServer.on('connection', (client) => {
   console.log(`[peerjs] connected: ${client.getId()}`);
