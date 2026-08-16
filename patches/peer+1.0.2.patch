@@ -1,5 +1,5 @@
 diff --git a/node_modules/peer/dist/index.cjs b/node_modules/peer/dist/index.cjs
-index 95618a2..5d4bf41 100644
+index 95618a2..17b000e 100644
 --- a/node_modules/peer/dist/index.cjs
 +++ b/node_modules/peer/dist/index.cjs
 @@ -294,18 +294,21 @@ class $e9ffe6de55430dbc$export$f47674b57e51ee3b extends (0, $cl6Iw$nodeevents.Ev
@@ -34,7 +34,7 @@ index 95618a2..5d4bf41 100644
              return;
          }
          this._registerClient({
-@@ -314,6 +317,62 @@ class $e9ffe6de55430dbc$export$f47674b57e51ee3b extends (0, $cl6Iw$nodeevents.Ev
+@@ -314,6 +317,68 @@ class $e9ffe6de55430dbc$export$f47674b57e51ee3b extends (0, $cl6Iw$nodeevents.Ev
              token: token
          });
      }
@@ -44,8 +44,10 @@ index 95618a2..5d4bf41 100644
 +    _resolveIdConflict(newSocket, id, newToken, existingClient) {
 +        const STALE_PROBE_TIMEOUT_MS = 1500;
 +        const existingSocket = existingClient.getSocket();
++        console.log(`[peerjs-patch] id conflict for "${id}" — probing existing socket (readyState=${existingSocket ? existingSocket.readyState : 'none'})`);
 +        // Already closed/closing at the transport level — no need to probe.
 +        if (!existingSocket || existingSocket.readyState !== existingSocket.OPEN) {
++            console.log(`[peerjs-patch] "${id}" existing socket not OPEN — evicting immediately`);
 +            this._evictAndRegister(id, newToken, newSocket, existingClient);
 +            return;
 +        }
@@ -56,6 +58,7 @@ index 95618a2..5d4bf41 100644
 +            clearTimeout(timer);
 +            existingSocket.removeListener("pong", onPong);
 +            // Old socket answered — it's a genuinely live second session.
++            console.log(`[peerjs-patch] "${id}" existing socket answered ping — genuinely in use, rejecting new connection`);
 +            newSocket.send(JSON.stringify({
 +                type: (0, $115ef0ff92fe1a17$export$80edbf15fa61a4db).ID_TAKEN,
 +                payload: {
@@ -69,6 +72,7 @@ index 95618a2..5d4bf41 100644
 +            settled = true;
 +            existingSocket.removeListener("pong", onPong);
 +            // No pong within the window — treat as dead and take over the ID.
++            console.log(`[peerjs-patch] "${id}" existing socket did not answer within ${STALE_PROBE_TIMEOUT_MS}ms — treating as dead, evicting`);
 +            this._evictAndRegister(id, newToken, newSocket, existingClient);
 +        }, STALE_PROBE_TIMEOUT_MS);
 +        try {
@@ -78,6 +82,7 @@ index 95618a2..5d4bf41 100644
 +            // ping() itself threw — socket is unusable, evict immediately.
 +            clearTimeout(timer);
 +            existingSocket.removeListener("pong", onPong);
++            console.log(`[peerjs-patch] "${id}" ping() threw (${e && e.message}) — evicting immediately`);
 +            this._evictAndRegister(id, newToken, newSocket, existingClient);
 +        }
 +    }
@@ -93,6 +98,7 @@ index 95618a2..5d4bf41 100644
 +            id: id,
 +            token: token
 +        });
++        console.log(`[peerjs-patch] "${id}" evicted stale session and registered new connection`);
 +    }
      _onSocketError(error) {
          // handle error
